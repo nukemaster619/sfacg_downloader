@@ -75,6 +75,10 @@ STRINGS = {
         "image_downloaded": "图片已下载",
         "plan_download": "准备下载分卷:",
         "volume_prompt": "请输入要下载的卷号(如 1,3-5，不输入则下载全部): ",
+        "chapter_prompt": "请输入该卷要下载的章节序号(如 1,3-5，不输入则下载整卷): ",
+        "chapter_error": "章节序号输入有误，请重新输入",
+        "choose_chapter": "可下载章节如下：",
+        "all_chapters": "全部章节",
         "volume_error": "卷号输入有误，请重新输入",
         "saved": "已保存 TXT 和 EPUB:",
         "fatal": "程序发生错误:",
@@ -123,6 +127,10 @@ STRINGS = {
         "image_downloaded": "image downloaded",
         "plan_download": "Selected volumes:",
         "volume_prompt": "Enter volume numbers to download (e.g. 1,3-5; blank = all): ",
+        "chapter_prompt": "Enter chapter numbers for this volume (e.g. 1,3-5; blank = whole volume): ",
+        "chapter_error": "Invalid chapter selection, please try again",
+        "choose_chapter": "Available chapters:",
+        "all_chapters": "all chapters",
         "volume_error": "Invalid volume selection, please try again",
         "saved": "Saved TXT and EPUB:",
         "fatal": "Program error:",
@@ -177,7 +185,36 @@ def choose_language() -> None:
 def sanitize_filename(name: str) -> str:
     cleaned = re.sub(r'[\\/:*?"<>|]', " ", name).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = cleaned.rstrip(" .")
     return cleaned or "output"
+
+def selection_filename_token(selected_volumes: Sequence["SelectedVolume"]) -> str:
+    parts: List[str] = []
+    for selection in selected_volumes:
+        if selection.chapter_indices is None:
+            parts.append(f"v{selection.index}-all")
+        else:
+            chapters = "-".join(str(index) for index in selection.chapter_indices)
+            parts.append(f"v{selection.index}-c{chapters}")
+    return sanitize_filename("_".join(parts))
+
+def unique_output_path(stem: str, suffix: str, output_dir: Path = Path(".")) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_stem = sanitize_filename(stem)
+    safe_suffix = suffix if suffix.startswith(".") else f".{suffix}"
+    path = output_dir / f"{safe_stem}{safe_suffix}"
+    if not path.exists():
+        return path
+
+    for counter in range(2, 10000):
+        candidate = output_dir / f"{safe_stem} ({counter}){safe_suffix}"
+        if not candidate.exists():
+            return candidate
+
+    raise RuntimeError(f"Could not find a free output filename for {safe_stem}{safe_suffix}")
+
+def write_text_file(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8", newline="\n")
 
 def detect_media_type(filename: str) -> str:
     lower = filename.lower()
@@ -257,6 +294,16 @@ class Volume:
     index: int
     title: str
     chapters: List[ChapterRef]
+
+@dataclass(frozen=True)
+class SelectedVolume:
+    index: int
+    chapter_indices: Optional[Tuple[int, ...]] = None
+
+    def display(self) -> str:
+        if self.chapter_indices is None:
+            return f"{self.index}:*"
+        return f"{self.index}:" + ",".join(str(index) for index in self.chapter_indices)
 
 @dataclass
 class NovelCatalog:
@@ -518,9 +565,11 @@ def ensure_login(client: SfacgClient) -> None:
 
         safe_print(tr("login_failed"))
 
-def parse_volume_selection(raw: str, total_volumes: int) -> List[int]:
+def parse_number_selection(raw: str, total_items: int, *, blank_means_all: bool = True) -> List[int]:
     if not raw.strip():
-        return list(range(1, total_volumes + 1))
+        if blank_means_all:
+            return list(range(1, total_items + 1))
+        raise ValueError(tr("empty_selection"))
 
     selected: set[int] = set()
     for part in raw.split(","):
@@ -534,19 +583,20 @@ def parse_volume_selection(raw: str, total_volumes: int) -> List[int]:
             end = int(end_str.strip())
             if start > end:
                 start, end = end, start
-            for value in range(start, end + 1):
-                if 1 <= value <= total_volumes:
-                    selected.add(value)
+            selected.update(value for value in range(start, end + 1) if 1 <= value <= total_items)
             continue
 
         value = int(item)
-        if 1 <= value <= total_volumes:
+        if 1 <= value <= total_items:
             selected.add(value)
 
     result = sorted(selected)
     if not result:
         raise ValueError(tr("empty_selection"))
     return result
+
+def parse_volume_selection(raw: str, total_volumes: int) -> List[int]:
+    return parse_number_selection(raw, total_volumes)
 
 def ask_volume_selection(total_volumes: int) -> List[int]:
     while True:
@@ -555,6 +605,32 @@ def ask_volume_selection(total_volumes: int) -> List[int]:
             return parse_volume_selection(raw, total_volumes)
         except Exception:
             safe_print(tr("volume_error"))
+
+def ask_chapter_selection(volume: Volume) -> Optional[Tuple[int, ...]]:
+    safe_print(f"{tr('choose_chapter')} {volume.title}")
+    for index, chapter in enumerate(volume.chapters, start=1):
+        safe_print(f"  {index}: {chapter.title_hint or chapter.chapter_id}")
+
+    while True:
+        raw = input(tr("chapter_prompt")).strip()
+        if not raw:
+            return None
+
+        try:
+            return tuple(parse_number_selection(raw, len(volume.chapters), blank_means_all=False))
+        except Exception:
+            safe_print(tr("chapter_error"))
+
+def ask_download_selection(catalog: NovelCatalog) -> List[SelectedVolume]:
+    selected_volume_indices = ask_volume_selection(len(catalog.volumes))
+    selected_volumes: List[SelectedVolume] = []
+
+    for volume_index in selected_volume_indices:
+        volume = catalog.volumes[volume_index - 1]
+        chapter_indices = ask_chapter_selection(volume)
+        selected_volumes.append(SelectedVolume(index=volume.index, chapter_indices=chapter_indices))
+
+    return selected_volumes
 
 IMG_PATTERN = re.compile(r"\[img=(https?://.*?)(?:\[/img\]|$)", re.IGNORECASE)
 
@@ -638,7 +714,7 @@ def chapter_to_xhtml(
 def build_epub_and_txt(
     client: SfacgClient,
     catalog: NovelCatalog,
-    selected_volumes: Sequence[int],
+    selected_volumes: Sequence[SelectedVolume],
 ) -> Tuple[str, str]:
     safe_print(tr("book_building"))
 
@@ -662,16 +738,27 @@ def build_epub_and_txt(
     toc_entries: List[Tuple[epub.EpubHtml, Tuple[epub.EpubHtml, ...]]] = []
     spine: List[object] = ["nav"]
 
+    selected_by_volume = {selection.index: selection for selection in selected_volumes}
+
     for volume in catalog.volumes:
-        if volume.index not in selected_volumes:
+        selection = selected_by_volume.get(volume.index)
+        if selection is None:
             safe_print(f"{tr('skipping_volume')} {volume.title}")
             continue
 
         safe_print(f"{tr('downloading_volume')} {volume.title}")
         txt_parts.extend([volume.title, "", ""])
 
+        wanted_chapter_indices = (
+            set(range(1, len(volume.chapters) + 1))
+            if selection.chapter_indices is None
+            else set(selection.chapter_indices)
+        )
         chapter_results: List[ChapterContent] = []
-        for chapter_ref in volume.chapters:
+        for chapter_index, chapter_ref in enumerate(volume.chapters, start=1):
+            if chapter_index not in wanted_chapter_indices:
+                continue
+
             chapter = client.fetch_chapter(chapter_ref)
             if chapter is not None:
                 chapter_results.append(chapter)
@@ -714,15 +801,16 @@ def build_epub_and_txt(
     book.add_item(epub.EpubNav())
 
     title_clean = sanitize_filename(catalog.title)
-    selection_tag = "[" + ",".join(str(index) for index in selected_volumes) + "]"
-    epub_name = f"{title_clean}{selection_tag}.epub"
-    txt_name = f"{title_clean}{selection_tag}.txt"
+    selection_token = selection_filename_token(selected_volumes)
+    output_stem = f"{title_clean}_{selection_token}" if selection_token else title_clean
+    epub_path = unique_output_path(output_stem, ".epub")
+    txt_path = unique_output_path(output_stem, ".txt")
 
     safe_print(tr("book_writing"))
-    epub.write_epub(epub_name, book, {})
-    Path(txt_name).write_text("\n".join(txt_parts), encoding="utf-8")
+    epub.write_epub(str(epub_path), book, {})
+    write_text_file(txt_path, "\n".join(txt_parts))
 
-    return txt_name, epub_name
+    return str(txt_path), str(epub_path)
 
 def main() -> None:
     choose_language()
@@ -744,8 +832,8 @@ def main() -> None:
     for volume in catalog.volumes:
         safe_print(f"{volume.index}: {volume.title}")
 
-    selected_volumes = ask_volume_selection(len(catalog.volumes))
-    safe_print(f"{tr('plan_download')} {selected_volumes}")
+    selected_volumes = ask_download_selection(catalog)
+    safe_print(f"{tr('plan_download')} {[selection.display() for selection in selected_volumes]}")
 
     txt_name, epub_name = build_epub_and_txt(client, catalog, selected_volumes)
     safe_print(f"{tr('saved')} {txt_name} / {epub_name}")
