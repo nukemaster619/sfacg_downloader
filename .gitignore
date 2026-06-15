@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+dist/
+.venv/
+*.spec
+cookie.txt
+*.epub
+*.txt
+cache/
+*.bat
